@@ -22,8 +22,7 @@ _G.vendingPoliceRange = 55
 local vendingLoopThread    = nil
 local instantCollectThread = nil
 
-local DROP_Y             = -5
-local SERVERHOP_POSITION = Vector3.new(-1292.9005126953125, DROP_Y, 3685.330810546875)
+local DROP_Y = -5
 
 _G.TeleportConfig = {
     TeleportActive    = false,
@@ -95,13 +94,11 @@ end
 -- ============================================================
 -- FLEE (Wegfliegen bei Polizei während Pickup)
 -- ============================================================
-local SAFE_POSITION = Vector3.new(-1292.9005126953125, DROP_Y, 3685.330810546875)
-
 local function fleeFromPolice()
     local _, _, root = getChar()
     if not root then return end
-    local safePos = SAFE_POSITION
-    -- Find a direction away from nearest cop
+    local safePos = root.Position
+
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= plr and p.Team and p.Team.Name == "Police" then
             local pChar = p.Character
@@ -218,10 +215,8 @@ local function startAutoCollect()
         end
     end
 
-    -- Collect drops that are already there when we arrive
     loot()
 
-    -- React instantly to new drops appearing
     local addConn = dropsFolder.ChildAdded:Connect(function(obj)
         if not _G.vendingActive then return end
         task.wait(0.05)
@@ -232,7 +227,6 @@ local function startAutoCollect()
         end
     end)
 
-    -- Also poll in case ChildAdded fires before Transparency is set
     while _G.vendingActive do
         loot()
         task.wait(0.25)
@@ -438,11 +432,52 @@ local function VendingRob(targetVending)
 end
 
 -- ============================================================
--- SERVERHOP
+-- SERVERHOP (500 Studs hoch von aktueller Position)
 -- ============================================================
 local function doServerHop()
-    notify("Server Hop", "No Vending Machines – switching server!")
-    task.wait(1)
+    notify("Server Hop", "Keine Vending Machines – Server wechsel!")
+
+    local vehicle = Workspace.Vehicles:FindFirstChild(plr.Name)
+    if vehicle then
+        local driveSeat = vehicle:FindFirstChild("DriveSeat", true)
+            or vehicle:FindFirstChildWhichIsA("VehicleSeat", true)
+
+        if driveSeat then
+            local _, humanoid, hrp = getChar()
+
+            -- Einsteigen falls nicht drin
+            if humanoid and humanoid.SeatPart ~= driveSeat then
+                if hrp then hrp.CFrame = driveSeat.CFrame end
+                task.wait(0.05)
+                driveSeat:Sit(humanoid)
+                task.wait(0.2)
+            end
+
+            vehicle.PrimaryPart = driveSeat
+
+            -- Aktuelle Position + 500 Studs hoch
+            local currentPos = vehicle:GetPivot().Position
+            local upTarget   = CFrame.new(Vector3.new(currentPos.X, currentPos.Y + 500, currentPos.Z))
+            local distance   = 500
+            local duration   = math.max(distance / (_G.flightSpeed * 1.5), 0.1) -- 1.5x Speed für schnellen Aufstieg
+
+            local val = Instance.new("CFrameValue")
+            val.Value = vehicle:GetPivot()
+            local conn = val.Changed:Connect(function(newCF)
+                vehicle:PivotTo(newCF)
+                driveSeat.AssemblyLinearVelocity  = Vector3.zero
+                driveSeat.AssemblyAngularVelocity = Vector3.zero
+            end)
+
+            local tw = TweenService:Create(val, TweenInfo.new(duration, Enum.EasingStyle.Linear), {Value = upTarget})
+            tw:Play()
+            tw.Completed:Wait()
+            conn:Disconnect()
+            val:Destroy()
+        end
+    end
+
+    -- Direkt hoppen
     local TeleportService = game:GetService("TeleportService")
     TeleportService:Teleport(game.PlaceId, plr)
 end
@@ -496,8 +531,6 @@ local function vendingMainLoop()
 
         local target = findNearestRobbableVending()
         if not target then
-            tweenTo(CFrame.new(SERVERHOP_POSITION))
-            task.wait(2)
             doServerHop()
             task.wait(10)
             continue
@@ -560,7 +593,7 @@ local MainTab = Window:MakeTab({
 
 MainTab:AddToggle({
     Name     = "Activate Vending Rob",
-    Default  = true,
+    Default  = false,
     Save     = false,
     Flag     = "vendingActive",
     Callback = function(Value)
