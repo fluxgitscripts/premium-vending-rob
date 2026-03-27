@@ -3,10 +3,6 @@ local TweenService        = game:GetService("TweenService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local StarterGui          = game:GetService("StarterGui")
 local Workspace           = game:GetService("Workspace")
-local TeleportService     = game:GetService("TeleportService")
-local HttpService         = game:GetService("HttpService")
-
-local queue_on_teleport = syn and syn.queue_on_teleport or queue_on_teleport or (fluxus and fluxus.queue_on_teleport)
 
 local plr = Players.LocalPlayer
 
@@ -19,25 +15,33 @@ local RemoteEvents = {
 local VENDING_COLLECT_CODE   = "wRl"
 local ProximityPromptTimeBet = 2.5
 
-_G.vendingActive        = false
-_G.flightSpeed          = 160
-_G.vendingPoliceRange   = 55
-_G.lowHealthThreshold   = 35
+_G.vendingActive      = false
+_G.flightSpeed        = 160
+_G.vendingPoliceRange = 55
 
 local vendingLoopThread    = nil
 local instantCollectThread = nil
 
-local teleportActive   = false
-local currentTween     = nil
-local currentTweenConn = nil
-local tweenSpeed       = _G.flightSpeed
+local DROP_Y             = -5
+local SERVERHOP_POSITION = Vector3.new(-1292.9005126953125, DROP_Y, 3685.330810546875)
 
-local DROP_Y        = -2
-local SAFE_POSITION = Vector3.new(-1292.9005126953125, DROP_Y, 3685.330810546875)
+_G.TeleportConfig = {
+    TeleportActive    = false,
+    CurrentTween      = nil,
+    CurrentConnection = nil,
+}
 
-local policeCache         = {}
-local policeCacheTime     = 0
-local POLICE_CACHE_DURATION = 0.5
+local function stopCurrentTween()
+    if _G.TeleportConfig.CurrentTween then
+        _G.TeleportConfig.CurrentTween:Cancel()
+        _G.TeleportConfig.CurrentTween = nil
+    end
+    if _G.TeleportConfig.CurrentConnection then
+        _G.TeleportConfig.CurrentConnection:Disconnect()
+        _G.TeleportConfig.CurrentConnection = nil
+    end
+    _G.TeleportConfig.TeleportActive = false
+end
 
 local function getChar()
     local char = plr.Character
@@ -54,12 +58,6 @@ local function clickAtCoordinates(rx, ry)
     VirtualInputManager:SendMouseButtonEvent(vp.X * rx, vp.Y * ry, 0, false, game, 0)
 end
 
-local function stopCurrentTween()
-    if currentTween then currentTween:Cancel(); currentTween = nil end
-    if currentTweenConn then currentTweenConn:Disconnect(); currentTweenConn = nil end
-    teleportActive = false
-end
-
 local function notify(title, text)
     StarterGui:SetCore("SendNotification", {
         Title = title,
@@ -68,140 +66,135 @@ local function notify(title, text)
     })
 end
 
-local function updatePoliceCache()
-    local currentTime = tick()
-    if currentTime - policeCacheTime < POLICE_CACHE_DURATION then return end
-    policeCache = {}
+local function isPoliceNearby()
+    local _, _, root = getChar()
+    if not root then return false end
+
+    local hum = root.Parent:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health <= 25 then
+        notify("HP Critical!", "Vending Rob paused!")
+        return true
+    end
+
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= plr and p.Team and p.Team.Name == "Police" then
             local pChar = p.Character
             if pChar then
                 local pRoot = pChar:FindFirstChild("HumanoidRootPart")
-                local pHum  = pChar:FindFirstChildOfClass("Humanoid")
-                if pRoot and pHum and pHum.Health > 0 then
-                    table.insert(policeCache, {
-                        player   = p,
-                        root     = pRoot,
-                        humanoid = pHum
-                    })
+                if pRoot and (pRoot.Position - root.Position).Magnitude <= _G.vendingPoliceRange then
+                    notify("Police Detected", "Vending Rob paused!")
+                    return true
                 end
             end
         end
     end
-    policeCacheTime = currentTime
-end
 
-local function isPoliceNearby()
-    local _, hum, root = getChar()
-    if not root then return false end
-    if hum and hum.Health <= _G.lowHealthThreshold then
-        notify("Low HP!", "Fleeing!")
-        return true
-    end
-    updatePoliceCache()
-    local myPos = root.Position
-    for _, pd in ipairs(policeCache) do
-        if pd.root and pd.root.Parent and pd.humanoid.Health > 0 then
-            if (pd.root.Position - myPos).Magnitude <= _G.vendingPoliceRange then
-                notify("Police Detected!", pd.player.Name .. " is nearby!")
-                return true
-            end
-        end
-    end
     return false
 end
 
-local function sitInVehicle()
-    local vehicle = Workspace.Vehicles:FindFirstChild(plr.Name)
-    if not vehicle then return false end
-    local driveSeat = vehicle:FindFirstChild("DriveSeat", true)
-        or vehicle:FindFirstChildWhichIsA("VehicleSeat", true)
-    if not driveSeat then return false end
-    local _, hum, hrp = getChar()
-    if hum and hrp then
-        hrp.CFrame = driveSeat.CFrame
-        task.wait(0.05)
-        driveSeat:Sit(hum)
-    end
-    return true, vehicle, driveSeat
-end
+-- ============================================================
+-- FLEE (Wegfliegen bei Polizei während Pickup)
+-- ============================================================
+local SAFE_POSITION = Vector3.new(-1292.9005126953125, DROP_Y, 3685.330810546875)
 
-local function fleeToNextVending()
-    notify("Police!", "Getting in vehicle and fleeing!")
-
-    local ok, vehicle, driveSeat = sitInVehicle()
-    if not ok then return end
-
-    vehicle.PrimaryPart = driveSeat
-
-    local folder = Workspace:FindFirstChild("Robberies")
-        and Workspace.Robberies:FindFirstChild("VendingMachines")
-
+local function fleeFromPolice()
     local _, _, root = getChar()
-    local targetPos = SAFE_POSITION
-
-    if folder and root then
-        local nearest, minDist = nil, math.huge
-        for _, model in ipairs(folder:GetChildren()) do
-            local light = model:FindFirstChild("Light")
-            local glass = model:FindFirstChild("Glass")
-            if light and glass and light:IsA("BasePart") then
-                local dist = (glass.Position - root.Position).Magnitude
-                if dist < minDist and dist > 20 then
-                    minDist = dist
-                    nearest = glass
+    if not root then return end
+    local safePos = SAFE_POSITION
+    -- Find a direction away from nearest cop
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= plr and p.Team and p.Team.Name == "Police" then
+            local pChar = p.Character
+            if pChar then
+                local pRoot = pChar:FindFirstChild("HumanoidRootPart")
+                if pRoot then
+                    local awayDir = (root.Position - pRoot.Position).Unit
+                    safePos = root.Position + awayDir * 120
+                    safePos = Vector3.new(safePos.X, DROP_Y, safePos.Z)
+                    break
                 end
             end
         end
-        if nearest then
-            targetPos = Vector3.new(nearest.Position.X, DROP_Y, nearest.Position.Z)
-        end
     end
 
-    local targetCF = CFrame.new(targetPos)
-    local dist     = (vehicle:GetPivot().Position - targetPos).Magnitude
-    local duration = math.max(dist / (_G.flightSpeed * 1.3), 0.1)
-
-    local val  = Instance.new("CFrameValue")
-    val.Value  = vehicle:GetPivot()
-    local conn = val.Changed:Connect(function(newCF) vehicle:PivotTo(newCF) end)
-    local tw   = TweenService:Create(val, TweenInfo.new(duration, Enum.EasingStyle.Linear), {Value = targetCF})
-    tw:Play()
-    tw.Completed:Wait()
-    conn:Disconnect()
-    val:Destroy()
+    local vehicle = Workspace.Vehicles:FindFirstChild(plr.Name)
+    if vehicle then
+        local driveSeat = vehicle:FindFirstChild("DriveSeat", true)
+            or vehicle:FindFirstChildWhichIsA("VehicleSeat", true)
+        if driveSeat then
+            local _, hum, hrp = getChar()
+            if hum and hrp then
+                hrp.CFrame = driveSeat.CFrame
+                task.wait(0.05)
+                driveSeat:Sit(hum)
+                task.wait(0.2)
+            end
+            vehicle.PrimaryPart = driveSeat
+            local targetCF = CFrame.new(safePos)
+            local dist = (vehicle:GetPivot().Position - safePos).Magnitude
+            local duration = math.max(dist / _G.flightSpeed, 0.1)
+            local val = Instance.new("CFrameValue")
+            val.Value = vehicle:GetPivot()
+            local conn = val.Changed:Connect(function(newCF)
+                vehicle:PivotTo(newCF)
+            end)
+            local tw = TweenService:Create(val, TweenInfo.new(duration, Enum.EasingStyle.Linear), {Value = targetCF})
+            tw:Play()
+            tw.Completed:Wait()
+            conn:Disconnect()
+            val:Destroy()
+        end
+    end
 end
 
+-- ============================================================
+-- AUTO COLLECT (Fixed)
+-- ============================================================
 local function startAutoCollect()
     local Character        = plr.Character or plr.CharacterAdded:Wait()
     local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
 
-    local Collected   = {}
-    local Range       = 30
-    local myName      = plr.Name
+    local Collected = {}
+    local Range     = 30
+    local myName    = plr.Name
+
     local dropsFolder = Workspace:WaitForChild("Drops")
 
     local function collectDrop(obj)
         if Collected[obj] then return end
         if not obj or not obj.Parent then return end
         if obj.Transparency ~= 0 then return end
+
         Collected[obj] = true
+
         task.spawn(function()
-            if isPoliceNearby() then Collected[obj] = nil; return end
+            if isPoliceNearby() then
+                Collected[obj] = nil
+                fleeFromPolice()
+                return
+            end
+
             RemoteEvents.RobEvent:FireServer(obj, VENDING_COLLECT_CODE, true)
+
             if isPoliceNearby() then
                 RemoteEvents.RobEvent:FireServer(obj, VENDING_COLLECT_CODE, false)
                 Collected[obj] = nil
+                fleeFromPolice()
                 return
             end
+
             task.wait(ProximityPromptTimeBet)
+
             if isPoliceNearby() then
                 RemoteEvents.RobEvent:FireServer(obj, VENDING_COLLECT_CODE, false)
                 Collected[obj] = nil
+                fleeFromPolice()
                 return
             end
+
             RemoteEvents.RobEvent:FireServer(obj, VENDING_COLLECT_CODE, false)
             task.wait(0.3)
+
             if obj and obj.Parent and obj.Transparency == 0 then
                 Collected[obj] = nil
             end
@@ -212,8 +205,11 @@ local function startAutoCollect()
         local _, _, root = getChar()
         if root then HumanoidRootPart = root end
         if not HumanoidRootPart then return end
+
         for _, obj in ipairs(dropsFolder:GetChildren()) do
-            if obj:IsA("MeshPart") and obj.Name == myName and obj.Transparency == 0
+            if obj:IsA("MeshPart")
+                and obj.Name == myName
+                and obj.Transparency == 0
                 and not Collected[obj]
                 and (obj.Position - HumanoidRootPart.Position).Magnitude <= Range
             then
@@ -222,8 +218,10 @@ local function startAutoCollect()
         end
     end
 
+    -- Collect drops that are already there when we arrive
     loot()
 
+    -- React instantly to new drops appearing
     local addConn = dropsFolder.ChildAdded:Connect(function(obj)
         if not _G.vendingActive then return end
         task.wait(0.05)
@@ -234,6 +232,7 @@ local function startAutoCollect()
         end
     end)
 
+    -- Also poll in case ChildAdded fires before Transparency is set
     while _G.vendingActive do
         loot()
         task.wait(0.25)
@@ -243,7 +242,10 @@ local function startAutoCollect()
 end
 
 local function stopInstantCollect()
-    if instantCollectThread then task.cancel(instantCollectThread); instantCollectThread = nil end
+    if instantCollectThread then
+        task.cancel(instantCollectThread)
+        instantCollectThread = nil
+    end
 end
 
 local function launchInstantCollect()
@@ -251,20 +253,27 @@ local function launchInstantCollect()
     instantCollectThread = task.spawn(startAutoCollect)
 end
 
-local function tweenTo(destination)
-    if teleportActive then stopCurrentTween() end
-    teleportActive = true
+-- ============================================================
+-- TWEEN TO (_G.TeleportConfig)
+-- ============================================================
+_G.TeleportConfig.TweenTo = function(destination)
+    if _G.TeleportConfig.TeleportActive then stopCurrentTween() end
+    _G.TeleportConfig.TeleportActive = true
 
     local character = plr.Character or plr.CharacterAdded:Wait()
     local humanoid  = character:FindFirstChildOfClass("Humanoid")
     local hrp       = character:FindFirstChild("HumanoidRootPart")
 
     local vehicle = Workspace.Vehicles:FindFirstChild(plr.Name)
-    if not vehicle then teleportActive = false; return false end
+    if not vehicle then
+        _G.TeleportConfig.TeleportActive = false
+        notify("Error", "No vehicle found!")
+        return false
+    end
 
     local driveSeat = vehicle:FindFirstChild("DriveSeat", true)
         or vehicle:FindFirstChildWhichIsA("VehicleSeat", true)
-    if not driveSeat then teleportActive = false; return false end
+    if not driveSeat then _G.TeleportConfig.TeleportActive = false; return false end
     vehicle.PrimaryPart = driveSeat
 
     if humanoid and humanoid.SeatPart ~= driveSeat then
@@ -273,7 +282,7 @@ local function tweenTo(destination)
         driveSeat:Sit(humanoid)
         local t = 0
         while humanoid.SeatPart ~= driveSeat and t < 15 do
-            if not teleportActive then return false end
+            if not _G.TeleportConfig.TeleportActive then return false end
             task.wait(0.1)
             t = t + 1
         end
@@ -288,42 +297,52 @@ local function tweenTo(destination)
     driveSeat.AssemblyAngularVelocity = Vector3.zero
     task.wait(0.05)
 
-    if not teleportActive then return false end
+    if not _G.TeleportConfig.TeleportActive then return false end
 
     local startPos = Vector3.new(pivotNow.X, DROP_Y, pivotNow.Z)
     local distance = (startPos - targetPos).Magnitude
 
     if distance > 0.5 then
-        tweenSpeed = _G.flightSpeed
-        local speedVariance = tweenSpeed * (0.92 + math.random() * 0.16)
+        local speedVariance = _G.flightSpeed * (0.92 + math.random() * 0.16)
         local duration      = distance / speedVariance
 
         local val = Instance.new("CFrameValue")
         val.Value = vehicle:GetPivot()
 
-        currentTweenConn = val.Changed:Connect(function(newCF)
+        _G.TeleportConfig.CurrentConnection = val.Changed:Connect(function(newCF)
             vehicle:PivotTo(newCF)
-            driveSeat.AssemblyLinearVelocity  = Vector3.new((math.random()-0.5)*0.08, 0, (math.random()-0.5)*0.08)
+            driveSeat.AssemblyLinearVelocity  = Vector3.new(
+                (math.random() - 0.5) * 0.08, 0, (math.random() - 0.5) * 0.08)
             driveSeat.AssemblyAngularVelocity = Vector3.zero
         end)
 
-        currentTween = TweenService:Create(val,
+        _G.TeleportConfig.CurrentTween = TweenService:Create(val,
             TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
             {Value = targetCF})
-        currentTween:Play()
-        currentTween.Completed:Wait()
+        _G.TeleportConfig.CurrentTween:Play()
+        _G.TeleportConfig.CurrentTween.Completed:Wait()
 
-        if currentTweenConn then currentTweenConn:Disconnect(); currentTweenConn = nil end
+        if _G.TeleportConfig.CurrentConnection then
+            _G.TeleportConfig.CurrentConnection:Disconnect()
+            _G.TeleportConfig.CurrentConnection = nil
+        end
         val:Destroy()
     end
 
-    teleportActive = false
-    currentTween   = nil
+    _G.TeleportConfig.TeleportActive = false
+    _G.TeleportConfig.CurrentTween   = nil
     driveSeat:Sit(humanoid)
     clickAtCoordinates(0.5, 0.9)
     return true
 end
 
+local function tweenTo(destination)
+    return _G.TeleportConfig.TweenTo(destination)
+end
+
+-- ============================================================
+-- PLR TWEEN
+-- ============================================================
 local function plrTween(targetCFrame)
     local _, hum, root = getChar()
     if not root then return end
@@ -352,13 +371,9 @@ local function plrTween(targetCFrame)
     tVal:Destroy()
 end
 
-local function isVendingReady(color)
-    local targetR, targetG, targetB = 73/255, 147/255, 0/255
-    return math.abs(color.R - targetR) < 0.05
-       and math.abs(color.G - targetG) < 0.05
-       and math.abs(color.B - targetB) < 0.05
-end
-
+-- ============================================================
+-- VENDING CORE
+-- ============================================================
 local function findNearestRobbableVending()
     local folder = Workspace:FindFirstChild("Robberies")
         and Workspace.Robberies:FindFirstChild("VendingMachines")
@@ -368,10 +383,12 @@ local function findNearestRobbableVending()
     if not root then return nil end
 
     local nearest, minDist = nil, math.huge
+    local targetColor = Color3.fromRGB(73, 147, 0)
+
     for _, model in ipairs(folder:GetChildren()) do
         local light = model:FindFirstChild("Light")
         local glass = model:FindFirstChild("Glass")
-        if light and glass and light:IsA("BasePart") and isVendingReady(light.Color) then
+        if light and glass and light:IsA("BasePart") and light.Color == targetColor then
             local dist = (glass.Position - root.Position).Magnitude
             if dist < minDist then
                 minDist = dist
@@ -379,6 +396,7 @@ local function findNearestRobbableVending()
             end
         end
     end
+
     return nearest
 end
 
@@ -390,15 +408,10 @@ local function VendingRob(targetVending)
 
     local targetPos = glass.Position - glass.CFrame.LookVector * 12
     local lookDir   = glass.CFrame.RightVector
-
-    local tweenSuccess = tweenTo(CFrame.lookAt(targetPos, targetPos + lookDir))
-    if not tweenSuccess then return false end
-
+    tweenTo(CFrame.lookAt(targetPos, targetPos + lookDir))
     task.wait(0.6)
-    if isPoliceNearby() then
-        fleeToNextVending()
-        return false
-    end
+
+    if isPoliceNearby() then return false end
 
     local _, hum, _ = getChar()
     if hum then hum.Sit = false end
@@ -408,167 +421,142 @@ local function VendingRob(targetVending)
     plrTween(CFrame.lookAt(offsetPos, glass.Position))
     task.wait(0.4)
 
-    if isPoliceNearby() then
-        fleeToNextVending()
-        return false
-    end
+    if isPoliceNearby() then return false end
 
     for i = 1, 10 do
-        if isPoliceNearby() then
-            fleeToNextVending()
-            return false
-        end
+        if isPoliceNearby() then return false end
         VirtualInputManager:SendKeyEvent(true,  Enum.KeyCode.F, false, game)
-        task.wait(0.05)
+        task.wait(0.1)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
-        task.wait(0.35)
+        task.wait(0.3)
     end
 
-    if isPoliceNearby() then
-        fleeToNextVending()
-        return false
-    end
+    if isPoliceNearby() then return false end
 
     task.wait(0.6)
     return true
 end
 
-local function flyUpAndHop()
-    notify("Server Hop", "Flying up - switching server!")
-    stopCurrentTween()
-
-    local vehicle = Workspace.Vehicles:FindFirstChild(plr.Name)
-    if vehicle then
-        local driveSeat = vehicle:FindFirstChild("DriveSeat", true)
-            or vehicle:FindFirstChildWhichIsA("VehicleSeat", true)
-        if driveSeat then
-            local _, hum, hrp = getChar()
-            if hum and hrp then
-                hrp.CFrame = driveSeat.CFrame
-                task.wait(0.05)
-                driveSeat:Sit(hum)
-                task.wait(0.1)
-            end
-            vehicle.PrimaryPart = driveSeat
-
-            local currentPos = vehicle:GetPivot().Position
-            local flyTarget  = CFrame.new(currentPos + Vector3.new(0, 500, 0))
-            local duration   = 500 / 1500
-
-            local val  = Instance.new("CFrameValue")
-            val.Value  = vehicle:GetPivot()
-            local conn = val.Changed:Connect(function(newCF)
-                vehicle:PivotTo(newCF)
-                driveSeat.AssemblyLinearVelocity  = Vector3.zero
-                driveSeat.AssemblyAngularVelocity = Vector3.zero
-            end)
-
-            local tw = TweenService:Create(val, TweenInfo.new(duration, Enum.EasingStyle.Linear), {Value = flyTarget})
-            tw:Play()
-            tw.Completed:Wait()
-            conn:Disconnect()
-            val:Destroy()
-        end
-    end
-
-    task.wait(0.2)
-
-    if queue_on_teleport then
-        local payload = [[
-            wait(3)
-            loadstring(game:HttpGet("https://raw.githubusercontent.com/fluxgitscripts/testtext/refs/heads/main/.lua"))()
-        ]]
-        pcall(function() queue_on_teleport(payload) end)
-    end
-
-    local success, servers = pcall(function()
-        return HttpService:JSONDecode(
-            game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100")
-        ).data
-    end)
-
-    if success and servers then
-        for _, server in pairs(servers) do
-            if server.playing < server.maxPlayers and server.id ~= game.JobId then
-                TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, plr)
-                return
-            end
-        end
-    end
-
+-- ============================================================
+-- SERVERHOP
+-- ============================================================
+local function doServerHop()
+    notify("Server Hop", "No Vending Machines – switching server!")
+    task.wait(1)
+    local TeleportService = game:GetService("TeleportService")
     TeleportService:Teleport(game.PlaceId, plr)
 end
 
+-- ============================================================
+-- MAIN LOOP
+-- ============================================================
+local function hasRobbableVending()
+    local folder = Workspace:FindFirstChild("Robberies")
+        and Workspace.Robberies:FindFirstChild("VendingMachines")
+    if not folder then return false end
+    local targetColor = Color3.fromRGB(73, 147, 0)
+    for _, model in ipairs(folder:GetChildren()) do
+        local light = model:FindFirstChild("Light")
+        local glass = model:FindFirstChild("Glass")
+        if light and glass and light:IsA("BasePart") and light.Color == targetColor then
+            return true
+        end
+    end
+    return false
+end
+
+local function waitUntilReady()
+    local char = plr.Character or plr.CharacterAdded:Wait()
+    char:WaitForChild("HumanoidRootPart", 15)
+
+    local t = 0
+    repeat
+        if not Workspace.Vehicles:FindFirstChild(plr.Name) then task.wait(0.5) end
+        t = t + 0.5
+    until Workspace.Vehicles:FindFirstChild(plr.Name) or t >= 15
+
+    t = 0
+    repeat
+        task.wait(0.5)
+        t = t + 0.5
+    until hasRobbableVending() or t >= 30
+end
+
 local function vendingMainLoop()
+    local count = 0
+
+    waitUntilReady()
     task.wait(1)
 
     while _G.vendingActive do
-        if not Workspace.Vehicles:FindFirstChild(plr.Name) then
-            notify("Waiting...", "Please spawn a vehicle!")
-            task.wait(3)
-            continue
-        end
-
         if isPoliceNearby() then
-            fleeToNextVending()
-            task.wait(2)
+            task.wait(5)
             continue
         end
 
         local target = findNearestRobbableVending()
-
         if not target then
-            flyUpAndHop()
-            break
+            tweenTo(CFrame.new(SERVERHOP_POSITION))
+            task.wait(2)
+            doServerHop()
+            task.wait(10)
+            continue
         end
 
         local result = VendingRob(target)
-        if not result then
-            task.wait(2)
+        if result then
+            count = count + 1
+        else
+            task.wait(4)
         end
 
-        task.wait(1)
+        task.wait(1.5)
     end
 end
 
+-- ============================================================
+-- TOGGLE
+-- ============================================================
 local function setVendingActive(enabled)
     _G.vendingActive = enabled
 
     if enabled then
-        policeCache     = {}
-        policeCacheTime = 0
         launchInstantCollect()
         if vendingLoopThread then task.cancel(vendingLoopThread) end
         vendingLoopThread = task.spawn(vendingMainLoop)
         notify("Vending Rob", "Activated!")
     else
         stopInstantCollect()
-        if vendingLoopThread then task.cancel(vendingLoopThread); vendingLoopThread = nil end
+        if vendingLoopThread then
+            task.cancel(vendingLoopThread)
+            vendingLoopThread = nil
+        end
         stopCurrentTween()
         notify("Vending Rob", "Deactivated!")
     end
 end
 
+-- ============================================================
+-- GUI
+-- ============================================================
 local OrionLib = loadstring(game:HttpGet("https://moon-hub.pages.dev/orion.lua"))()
 
 local Window = OrionLib:MakeWindow({
     Name         = "Vending Rob",
     HidePremium  = false,
     Intro        = true,
-    IntroText    = "Launching Vending Rob...",
-    IntroIcon    = "rbxassetid://79390235538362",
+    IntroText    = "Vending Rob",
+    IntroIcon    = "rbxassetid://4483345998",
     SaveConfig   = true,
     ConfigFolder = "VendingRobConfig",
     Icon         = "rbxassetid://4483345998"
 })
 
 local MainTab = Window:MakeTab({
-    Name        = "Vending Rob",
+    Name        = "Main",
     Icon        = "rbxassetid://4483345998",
     PremiumOnly = false
 })
-
-MainTab:AddSection({ Name = "Robbery" })
 
 MainTab:AddToggle({
     Name     = "Activate Vending Rob",
@@ -580,21 +568,18 @@ MainTab:AddToggle({
     end
 })
 
-MainTab:AddSection({ Name = "Settings" })
-
 MainTab:AddSlider({
     Name      = "Flight Speed",
     Min       = 50,
     Max       = 250,
     Default   = 160,
-    Color     = Color3.fromRGB(137, 207, 240),
+    Color     = Color3.fromRGB(255, 255, 255),
     Increment = 10,
     ValueName = "speed",
     Save      = true,
     Flag      = "flightSpeed",
     Callback  = function(Value)
         _G.flightSpeed = Value
-        tweenSpeed     = Value
     end
 })
 
@@ -603,28 +588,13 @@ MainTab:AddSlider({
     Min       = 30,
     Max       = 100,
     Default   = 55,
-    Color     = Color3.fromRGB(137, 207, 240),
+    Color     = Color3.fromRGB(255, 255, 255),
     Increment = 5,
     ValueName = "studs",
     Save      = true,
     Flag      = "vendingPoliceRange",
     Callback  = function(Value)
         _G.vendingPoliceRange = Value
-    end
-})
-
-MainTab:AddSlider({
-    Name      = "Low Health Threshold",
-    Min       = 20,
-    Max       = 60,
-    Default   = 35,
-    Color     = Color3.fromRGB(255, 100, 100),
-    Increment = 5,
-    ValueName = "HP",
-    Save      = true,
-    Flag      = "lowHealthThreshold",
-    Callback  = function(Value)
-        _G.lowHealthThreshold = Value
     end
 })
 
@@ -640,7 +610,7 @@ ConfigTab:AddButton({
         OrionLib:ResetConfiguration()
         OrionLib:MakeNotification({
             Name    = "Success",
-            Content = "Config has been reset.",
+            Content = "Config reset.",
             Image   = "rbxassetid://4483345998",
             Time    = 4
         })
