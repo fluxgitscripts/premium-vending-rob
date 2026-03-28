@@ -2,6 +2,9 @@ local CoreGui = game:GetService("CoreGui")
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 
+-- FIX: LocalPlayer sofort holen, aber sicher mit WaitForChild-Fallback
+local plr = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait() and Players.LocalPlayer
+
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "MoonHubWatermark"
 screenGui.ResetOnSpawn = false
@@ -148,12 +151,14 @@ RunService.RenderStepped:Connect(function()
     end
 end)
 
+-- FIX: GetNetworkPing mit nil-Guard und pcall (verhindert "attempt to index nil with GetNetworkPing")
 RunService.Heartbeat:Connect(function()
-    -- Fix: LocalPlayer kann beim Start noch nil sein
     local localPlr = Players.LocalPlayer
     if not localPlr then return end
-
-    local ping = math.round(localPlr:GetNetworkPing() * 1000)
+    local ok, ping = pcall(function()
+        return math.round(localPlr:GetNetworkPing() * 1000)
+    end)
+    if not ok then return end
 
     pingLabel.Text = tostring(ping)
 
@@ -166,7 +171,6 @@ RunService.Heartbeat:Connect(function()
     end
 end)
 
-local Players             = game:GetService("Players")
 local TweenService        = game:GetService("TweenService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local StarterGui          = game:GetService("StarterGui")
@@ -174,7 +178,7 @@ local Workspace           = game:GetService("Workspace")
 local HttpService         = game:GetService("HttpService")
 local TeleportService     = game:GetService("TeleportService")
 
-local plr = Players.LocalPlayer
+if not plr then plr = Players.LocalPlayer end
 
 local EJw = game:GetService("ReplicatedStorage"):WaitForChild("EJw")
 local RemoteEvents = {
@@ -188,10 +192,8 @@ local ProximityPromptTimeBet = 2.3
 _G.vendingActive      = false
 _G.flightSpeed        = 160
 _G.vendingPoliceRange = 30
-
--- NEW: Low HP settings
 _G.lowHpActive        = false
-_G.lowHpThreshold     = 30  -- HP-Wert unter dem reagiert wird
+_G.lowHpThreshold     = 30
 
 local vendingLoopThread    = nil
 local instantCollectThread = nil
@@ -260,8 +262,8 @@ local function stopCurrentTween()
     _G.TeleportConfig.TeleportActive = false
 end
 
+-- FIX: getChar komplett mit pcall gesichert (verhindert "attempt to index nil with Character")
 local function getChar()
-    -- Fix: plr kann nil sein, Character muss explizit geprüft werden
     if not plr then return nil, nil, nil end
     local ok, char = pcall(function() return plr.Character end)
     if not ok or not char then return nil, nil, nil end
@@ -309,8 +311,8 @@ local function isPoliceNearby()
     return false
 end
 
+-- FIX: isPlayerInPrison mit pcall — plr.Team wirft Fehler wenn noch nicht geladen (Line 307)
 local function isPlayerInPrison()
-    -- Fix: plr oder plr.Team kann beim Laden noch nil sein
     if not plr then return false end
     local ok, team = pcall(function() return plr.Team end)
     if not ok or not team then return false end
@@ -369,8 +371,15 @@ local function doServerHop(reason)
 end
 
 local function startAutoCollect()
-    local Character        = plr.Character or plr.CharacterAdded:Wait()
-    local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+    if not plr then return end
+    -- FIX: Character sicher mit pcall holen
+    local ok, Character = pcall(function()
+        return plr.Character or plr.CharacterAdded:Wait()
+    end)
+    if not ok or not Character then return end
+
+    local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart", 15)
+    if not HumanoidRootPart then return end
 
     local Collected = {}
     local Range     = 30
@@ -456,7 +465,13 @@ _G.TeleportConfig.TweenTo = function(destination)
     if _G.TeleportConfig.TeleportActive then stopCurrentTween() end
     _G.TeleportConfig.TeleportActive = true
 
-    local character = plr.Character or plr.CharacterAdded:Wait()
+    -- FIX: Character sicher mit pcall holen
+    if not plr then _G.TeleportConfig.TeleportActive = false; return false end
+    local okC, character = pcall(function()
+        return plr.Character or plr.CharacterAdded:Wait()
+    end)
+    if not okC or not character then _G.TeleportConfig.TeleportActive = false; return false end
+
     local humanoid  = character:FindFirstChildOfClass("Humanoid")
     local hrp       = character:FindFirstChild("HumanoidRootPart")
 
@@ -657,18 +672,15 @@ local function hasRobbableVending()
     return false
 end
 
--- FIXED: waitUntilReady now returns false and server hops immediately
--- if no vending machines are found after the timeout, instead of waiting 30s
--- and then going through the loop to find out there's nothing there.
+-- FIX: waitUntilReady — Character nie direkt indexen, immer pcall + HRP-nil-Check (Line 655)
 local function waitUntilReady()
-    -- Fix: Character sicher warten ohne direkt zu indexen wenn nil
     if not plr then return false end
 
     local char
-    local ok = pcall(function()
+    local okC = pcall(function()
         char = plr.Character or plr.CharacterAdded:Wait()
     end)
-    if not ok or not char then return false end
+    if not okC or not char then return false end
 
     local hrp = char:WaitForChild("HumanoidRootPart", 15)
     if not hrp then return false end
@@ -685,7 +697,6 @@ local function waitUntilReady()
         t = t + 0.5
     until hasRobbableVending() or t >= 30
 
-    -- Direkt serverhop wenn keine Vending Machine gefunden wurde
     if not hasRobbableVending() then
         doServerHop("No Vending Machines")
         return false
@@ -694,10 +705,6 @@ local function waitUntilReady()
     return true
 end
 
--- NEW: Low HP check loop
--- If lowHpActive is enabled and the player's HP drops below the threshold:
--- Try to tween to the nearest vending machine first.
--- If none is found nearby, server hop instead.
 local lowHpTriggered = false
 
 local function startLowHpCheck()
@@ -723,7 +730,6 @@ local function startLowHpCheck()
                 lowHpTriggered = true
                 notify("Low HP", "HP kritisch (" .. math.floor(hp) .. ")! Weiche aus...")
 
-                -- Versuche zur nächsten Vending Machine zu tweenen
                 local nextTarget = findNearestRobbableVending()
                 if nextTarget then
                     local glass = nextTarget:FindFirstChild("Glass")
@@ -732,10 +738,8 @@ local function startLowHpCheck()
                         local lookDir   = glass.CFrame.RightVector
                         tweenTo(CFrame.lookAt(targetPos, targetPos + lookDir))
                         task.wait(1)
-                        -- HP nochmal prüfen nach dem Tween
                         local _, hum2, _ = getChar()
                         if hum2 and hum2.Health <= _G.lowHpThreshold then
-                            -- Immer noch zu wenig HP -> serverhop
                             doServerHop("Low HP")
                         end
                     else
@@ -762,7 +766,6 @@ local function stopLowHpCheck()
 end
 
 local function vendingMainLoop()
-    -- FIXED: Direkt raus wenn keine Vending Machine gefunden und bereits gehoppt
     if not waitUntilReady() then return end
     task.wait(1)
 
@@ -774,7 +777,6 @@ local function vendingMainLoop()
             end
             if not _G.vendingActive then break end
             print("Prison Check - You are free! Resuming vending robbery.")
-            -- FIXED: Auch beim Neustart nach Gefängnis direkt hoppen wenn keine Machines
             if not waitUntilReady() then return end
             task.wait(1)
         end
@@ -873,7 +875,6 @@ MainTab:AddToggle({
     end
 })
 
--- NEW: Low HP Escape Toggle
 MainTab:AddToggle({
     Name     = "Low HP Escape",
     Default  = _G.lowHpActive,
@@ -933,7 +934,6 @@ MainTab:AddSlider({
     end
 })
 
--- NEW: Low HP Threshold Slider
 MainTab:AddSlider({
     Name      = "Low HP Threshold",
     Min       = 5,
