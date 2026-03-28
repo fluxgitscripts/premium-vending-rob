@@ -149,7 +149,11 @@ RunService.RenderStepped:Connect(function()
 end)
 
 RunService.Heartbeat:Connect(function()
-    local ping = math.round(Players.LocalPlayer:GetNetworkPing() * 1000)
+    -- Fix: LocalPlayer kann beim Start noch nil sein
+    local localPlr = Players.LocalPlayer
+    if not localPlr then return end
+
+    local ping = math.round(localPlr:GetNetworkPing() * 1000)
 
     pingLabel.Text = tostring(ping)
 
@@ -257,8 +261,10 @@ local function stopCurrentTween()
 end
 
 local function getChar()
-    local char = plr.Character
-    if not char then return nil, nil, nil end
+    -- Fix: plr kann nil sein, Character muss explizit geprüft werden
+    if not plr then return nil, nil, nil end
+    local ok, char = pcall(function() return plr.Character end)
+    if not ok or not char then return nil, nil, nil end
     local hum  = char:FindFirstChildOfClass("Humanoid")
     local root = char:FindFirstChild("HumanoidRootPart")
     return char, hum, root
@@ -304,11 +310,11 @@ local function isPoliceNearby()
 end
 
 local function isPlayerInPrison()
-    local team = plr.Team
-    if team and team.Name == "Prisoner" then
-        return true
-    end
-    return false
+    -- Fix: plr oder plr.Team kann beim Laden noch nil sein
+    if not plr then return false end
+    local ok, team = pcall(function() return plr.Team end)
+    if not ok or not team then return false end
+    return team.Name == "Prisoner"
 end
 
 local function doServerHop(reason)
@@ -651,9 +657,21 @@ local function hasRobbableVending()
     return false
 end
 
+-- FIXED: waitUntilReady now returns false and server hops immediately
+-- if no vending machines are found after the timeout, instead of waiting 30s
+-- and then going through the loop to find out there's nothing there.
 local function waitUntilReady()
-    local char = plr.Character or plr.CharacterAdded:Wait()
-    char:WaitForChild("HumanoidRootPart", 15)
+    -- Fix: Character sicher warten ohne direkt zu indexen wenn nil
+    if not plr then return false end
+
+    local char
+    local ok = pcall(function()
+        char = plr.Character or plr.CharacterAdded:Wait()
+    end)
+    if not ok or not char then return false end
+
+    local hrp = char:WaitForChild("HumanoidRootPart", 15)
+    if not hrp then return false end
 
     local t = 0
     repeat
@@ -676,6 +694,10 @@ local function waitUntilReady()
     return true
 end
 
+-- NEW: Low HP check loop
+-- If lowHpActive is enabled and the player's HP drops below the threshold:
+-- Try to tween to the nearest vending machine first.
+-- If none is found nearby, server hop instead.
 local lowHpTriggered = false
 
 local function startLowHpCheck()
